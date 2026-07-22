@@ -139,13 +139,14 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
     Cosine similarity based detection (replaces KDE).
 
     flat_grad_dirs: {c: grad_vec} - averaged gradient directions per class for current round
+                    ONLY contains suspect classes (e.g., {3, 5, 7, 8})
     flat_losses: {c: loss} - averaged losses per class for current round
     history: tuple (grad_history, loss_history) from DetectionHistory.get_history()
     kde_config: dict with cos_threshold, history_window, min_history, tau_loss
 
     Returns:
-        p_c: {class: pollution_score}
-        suspected_classes: set of suspicious classes
+        p_c: {class: pollution_score} - ONLY for suspect classes
+        suspected_classes: set of suspicious classes (subset of input keys)
         diag: diagnostic info
     """
     grad_history, loss_history = history
@@ -159,12 +160,12 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
     p_c = {}
     suspected_classes = set()
 
-    for c in range(num_classes):
+    # Only process classes that have current gradient directions (the 4 suspect classes)
+    for c in flat_grad_dirs.keys():
         # Collect historical gradient directions for class c
         hist_grads = []
         for h_grads in grad_history:
             if c in h_grads:
-                # 双保险：确保在 CPU 上 stack（history 已在 append 时 .cpu()，这里再保一手）
                 hist_grads.append(h_grads[c].cpu())
         if len(hist_grads) < 2:
             p_c[c] = 0.0
@@ -175,10 +176,6 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
         hist_avg = hist_avg / (hist_avg.norm() + 1e-12)
 
         # Current round direction (already averaged across clients) - move to CPU for detection
-        if c not in flat_grad_dirs:
-            p_c[c] = 0.0
-            continue
-
         curr_avg = flat_grad_dirs[c].cpu()
         curr_avg = curr_avg / (curr_avg.norm() + 1e-12)
 

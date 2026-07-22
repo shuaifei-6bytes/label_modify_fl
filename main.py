@@ -261,12 +261,6 @@ class LabelModifyExperiment:
             flat_grads[c] /= class_counts[c]
             flat_losses[c] /= class_counts[c]
 
-        # 为未计算的类补零，保证 lga_kde_detect 输入维度一致
-        for c in range(self.num_classes):
-            if c not in flat_grads:
-                flat_grads[c] = torch.zeros_like(list(flat_grads.values())[0]) if flat_grads else torch.zeros(1)
-                flat_losses[c] = 0.0
-
         p_c, suspected_classes, diag = lga_kde_detect(
             flat_grads, flat_losses, history, self.kde_config)
 
@@ -311,7 +305,7 @@ class LabelModifyExperiment:
         global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
 
         client_updates = []
-        for cid in range(self.num_clients):
+        for cid in self.benign_clients:
             local_model = get_model(self.model_name, num_classes=self.num_classes)
             local_model.to(self.device)
             local_model.load_state_dict(global_state_cpu)
@@ -330,7 +324,7 @@ class LabelModifyExperiment:
             client_updates.append((update, n_samples))
 
         trim_ratio = np.mean(
-            [p_c.get(c, 0.0) for c in range(self.num_classes)])
+            [p_c.get(c, 0.0) for c in flat_grads.keys()])
         new_state = weighted_trimmed_aggregate(
             global_state_cpu, client_updates, weights, trim_ratio)
         self.model.load_state_dict(new_state)
@@ -437,12 +431,6 @@ class LabelModifyExperiment:
         for c in flat_grads:
             flat_grads[c] /= class_counts[c]
             flat_losses[c] /= class_counts[c]
-
-        # 为未计算的类补零，保证 history_tracker 维度一致
-        for c in range(self.num_classes):
-            if c not in flat_grads:
-                flat_grads[c] = torch.zeros_like(list(flat_grads.values())[0]) if flat_grads else torch.zeros(1)
-                flat_losses[c] = 0.0
 
         self.history_tracker.update(flat_grads, flat_losses)
 
