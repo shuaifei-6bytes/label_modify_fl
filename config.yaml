@@ -1,0 +1,49 @@
+# ============================================================
+# LabelModifyFL 实验配置 — GPU-optimized
+# ============================================================
+
+# --- 基础设定 ---
+seed: 42
+model: resnet18               # lenet / simplecnn / resnet18
+dataset: cifar10
+use_amp: true                  # 自动混合精度 (GPU 推荐开启)
+
+# --- 联邦学习 ---
+num_clients: 10
+dirichlet_alpha: 0.5
+batch_size: 128
+local_epochs: 1
+lr: 0.01
+momentum: 0.9
+weight_decay: 0.0005
+global_rounds: 100
+
+# --- 数据加载 (GPU 优化) ---
+num_workers: 2                 # DataLoader workers (Colab T4 ≈ 2, V100/A100 ≈ 4)
+pin_memory: true               # 固定内存加速 CPU→GPU 传输
+
+# --- 检测触发 ---
+detection_interval: 10         # 每 N 轮触发一次余弦相似度检测（5→10，检测轮减半）
+
+# --- 标签修改模拟 ---
+legit_from: 5
+legit_to: 7
+mal_from: 3
+mal_to: 8
+mal_ratio: 0.2
+legit_ratio: 0.3
+modify_ratio: 0.5
+
+# --- 余弦相似度检测超参 ---
+history_window: 10
+cos_threshold: 0.68           # 余弦相似度阈值 (<0.68 即可疑，约 47°)
+min_history: 3                # 最少历史轮数才开始检测
+tau_loss: 2.0                 # 损失跳变阈值
+
+# --- 遗忘超参 ---
+unlearn_epochs: 12
+unlearn_lr: 0.05
+mask_topk_ratio: 0.1
+p_c_clip_min: 0.0
+p_c_clip_max: 1.0
+trim_ratio: 0.2
