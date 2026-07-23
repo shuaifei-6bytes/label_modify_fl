@@ -4,6 +4,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 import yaml
+import os
 from collections import Counter
 
 
@@ -13,7 +14,12 @@ def load_config(path="config.yaml"):
 
 
 def get_cifar10_dataloaders(config):
-    """Load CIFAR-10 with Dirichlet Non‑IID splits. GPU‑ready (pin_memory)."""
+    """Load CIFAR-10 with Dirichlet Non-IID splits. GPU-ready (pin_memory).
+    
+    Config keys:
+        cifar_root: root directory for CIFAR-10 data (default: ./data, 
+                    can be overridden by env var CIFAR10_ROOT or TORCH_HOME)
+    """
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -29,11 +35,14 @@ def get_cifar10_dataloaders(config):
     num_workers = config.get("num_workers", 2 if use_cuda else 0)
     pin_memory = config.get("pin_memory", use_cuda)
 
+    # 支持自定义数据根目录：config > env CIFAR10_ROOT > env TORCH_HOME > ./data
+    cifar_root = config.get("cifar_root") or os.environ.get("CIFAR10_ROOT") or os.environ.get("TORCH_HOME") or "./data"
+    
     try:
         train_set = torchvision.datasets.CIFAR10(
-            root="./data", train=True, download=True, transform=transform_train)
+            root=cifar_root, train=True, download=True, transform=transform_train)
         test_set = torchvision.datasets.CIFAR10(
-            root="./data", train=False, download=True, transform=transform_test)
+            root=cifar_root, train=False, download=True, transform=transform_test)
     except Exception as e:
         print(f"  CIFAR-10 下载失败 ({e})，使用 FakeData 代替")
         train_set = torchvision.datasets.FakeData(
