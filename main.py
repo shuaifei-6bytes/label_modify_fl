@@ -325,8 +325,10 @@ class LabelModifyExperiment:
 
         trim_ratio = np.mean(
             [p_c.get(c, 0.0) for c in flat_grads.keys()])
+        # Filter weights to only include benign clients
+        benign_weights = [weights[c] for c in self.benign_clients]
         new_state = weighted_trimmed_aggregate(
-            global_state_cpu, client_updates, weights, trim_ratio)
+            global_state_cpu, client_updates, benign_weights, trim_ratio)
         self.model.load_state_dict(new_state)
 
         class_masks = {}
