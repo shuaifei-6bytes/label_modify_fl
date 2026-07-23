@@ -19,7 +19,7 @@ weight_decay: 0.0005
 global_rounds: 100
 
 # --- 数据加载 (GPU 优化) ---
-num_workers: 2                 # DataLoader workers (Colab T4 ≈ 2, V100/A100 ≈ 4)
+num_workers: 0                 # DataLoader workers (Colab T4 ≈ 2, V100/A100 ≈ 4)
 pin_memory: true               # 固定内存加速 CPU→GPU 传输
 
 # --- 检测触发 ---
@@ -41,8 +41,8 @@ min_history: 3                # 最少历史轮数才开始检测
 tau_loss: 2.0                 # 损失跳变阈值
 
 # --- 遗忘超参 ---
-unlearn_epochs: 12
-unlearn_lr: 0.05
+unlearn_epochs: 5
+unlearn_lr: 0.01
 mask_topk_ratio: 0.1
 p_c_clip_min: 0.0
 p_c_clip_max: 1.0
