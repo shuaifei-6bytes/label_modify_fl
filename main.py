@@ -251,10 +251,27 @@ class LabelModifyExperiment:
                     torch.cuda.empty_cache()
 
             # Flatten per-round {cid → {c → grad}} into {c → grad_avg} for KDE
-            # 关键修复：只用良性客户端的梯度计算均值，避免恶意梯度被稀释
+            # === 修复：用【全客户端平均】做检测，良性均值仅用于聚合 ===
+            flat_grads_all = {}
+            flat_losses_all = {}
+            from collections import defaultdict
+            class_counts_all = defaultdict(int)
+            for cid in range(self.num_clients):
+                for c in all_grad_dirs[cid]:
+                    if c not in flat_grads_all:
+                        flat_grads_all[c] = all_grad_dirs[cid][c].clone()
+                        flat_losses_all[c] = all_losses[cid].get(c, 0.0)
+                    else:
+                        flat_grads_all[c] += all_grad_dirs[cid][c]
+                        flat_losses_all[c] += all_losses[cid].get(c, 0.0)
+                    class_counts_all[c] += 1
+            for c in flat_grads_all:
+                flat_grads_all[c] /= class_counts_all[c]
+                flat_losses_all[c] /= class_counts_all[c]
+
+            # 良性客户端均值（仅用于聚合加权）
             flat_grads = {}
             flat_losses = {}
-            from collections import defaultdict
             class_counts = defaultdict(int)
             for cid in self.benign_clients:
                 for c in all_grad_dirs[cid]:
@@ -270,7 +287,7 @@ class LabelModifyExperiment:
                 flat_losses[c] /= class_counts[c]
 
             p_c, suspected_classes, diag = lga_kde_detect(
-                flat_grads, flat_losses, history, self.kde_config)
+                flat_grads_all, flat_losses_all, history, self.kde_config)
 
             # ---- 新增：基于 per-client 类梯度方向 做客户端级打分 ----
             # suspected_classes 是可疑的类索引集合，如 {3, 8}
