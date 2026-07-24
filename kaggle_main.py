@@ -686,6 +686,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="/kaggle/working/label_modify_fl",
                         help="结果输出目录 (Kaggle 默认 /kaggle/working/label_modify_fl)")
+    parser.add_argument("--cifar-root", type=str, default=None,
+                        help="CIFAR-10 数据集根目录 (默认使用 ./data 或环境变量 CIFAR10_ROOT)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -704,6 +706,8 @@ def main():
         config["dirichlet_alpha"] = args.alpha
     if args.no_amp:
         config["use_amp"] = False
+    if args.cifar_root is not None:
+        config["cifar_root"] = args.cifar_root
 
     exp = LabelModifyExperiment(config, output_dir=args.output_dir)
     exp.run()
