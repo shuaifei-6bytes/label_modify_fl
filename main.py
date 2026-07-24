@@ -131,6 +131,9 @@ class LabelModifyExperiment:
 
         self.metrics = defaultdict(list)
 
+        # === 优化 3：clean_loader 缓存（按 exclude_classes 缓存） ===
+        self._clean_loader_cache = {}
+
     def setup_data(self):
         print("加载 CIFAR-10 数据集 (Dirichlet Non-IID split)...")
         (self.train_loaders, self.test_loader,
@@ -166,6 +169,11 @@ class LabelModifyExperiment:
         self.total_params = count_parameters(self.model)
         self.model_name = model_name
         print(f"  模型: {model_name}, 参数量: {self.total_params:,}")
+
+        # === 优化 1：预分配本地模型池，避免每轮 new 模型 + load_state_dict 开销 ===
+        self.local_models = [get_model(self.model_name, num_classes=self.num_classes) for _ in range(self.num_clients)]
+        for m in self.local_models:
+            m.to(self.device)
 
     def get_client_loader(self, cid):
         return self.train_loaders[cid]
@@ -223,168 +231,176 @@ class LabelModifyExperiment:
         return modified_info
 
     def run_detection_round(self):
-        history = self.history_tracker.get_history()
-        all_grad_dirs = {}
-        all_losses = {}
-        all_class_mags = {}
+            history = self.history_tracker.get_history()
+            all_grad_dirs = {}
+            all_losses = {}
+            all_class_mags = {}
 
-        # 只对 4 个可疑类计算梯度：mal_from, legit_from, mal_to, legit_to
-        # 其余 6 类跳过，直接节省 60% 检测轮显存/时间，语义完全保留
-        suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
+            # 只对 4 个可疑类计算梯度：mal_from, legit_from, mal_to, legit_to
+            # 其余 6 类跳过，直接节省 60% 检测轮显存/时间，语义完全保留
+            suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
 
-        for cid in range(self.num_clients):
-            class_loaders = self.client_class_loaders[cid]
-            grad_dirs, losses, grad_mags = compute_class_conditional_gradients(
-                self.model, class_loaders, self.device, classes_of_interest=suspect_classes)
-            all_grad_dirs[cid] = grad_dirs
-            all_losses[cid] = losses
-            all_class_mags[cid] = grad_mags
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+            for cid in range(self.num_clients):
+                class_loaders = self.client_class_loaders[cid]
+                grad_dirs, losses, grad_mags = compute_class_conditional_gradients(
+                    self.model, class_loaders, self.device, classes_of_interest=suspect_classes)
+                all_grad_dirs[cid] = grad_dirs
+                all_losses[cid] = losses
+                all_class_mags[cid] = grad_mags
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-        # Flatten per-round {cid → {c → grad}} into {c → grad_avg} for KDE
-        # 关键修复：只用良性客户端的梯度计算均值，避免恶意梯度被稀释
-        flat_grads = {}
-        flat_losses = {}
-        from collections import defaultdict
-        class_counts = defaultdict(int)
-        for cid in self.benign_clients:
-            for c in all_grad_dirs[cid]:
-                if c not in flat_grads:
-                    flat_grads[c] = all_grad_dirs[cid][c].clone()
-                    flat_losses[c] = all_losses[cid].get(c, 0.0)
-                else:
-                    flat_grads[c] += all_grad_dirs[cid][c]
-                    flat_losses[c] += all_losses[cid].get(c, 0.0)
-                class_counts[c] += 1
-        for c in flat_grads:
-            flat_grads[c] /= class_counts[c]
-            flat_losses[c] /= class_counts[c]
+            # Flatten per-round {cid → {c → grad}} into {c → grad_avg} for KDE
+            # 关键修复：只用良性客户端的梯度计算均值，避免恶意梯度被稀释
+            flat_grads = {}
+            flat_losses = {}
+            from collections import defaultdict
+            class_counts = defaultdict(int)
+            for cid in self.benign_clients:
+                for c in all_grad_dirs[cid]:
+                    if c not in flat_grads:
+                        flat_grads[c] = all_grad_dirs[cid][c].clone()
+                        flat_losses[c] = all_losses[cid].get(c, 0.0)
+                    else:
+                        flat_grads[c] += all_grad_dirs[cid][c]
+                        flat_losses[c] += all_losses[cid].get(c, 0.0)
+                    class_counts[c] += 1
+            for c in flat_grads:
+                flat_grads[c] /= class_counts[c]
+                flat_losses[c] /= class_counts[c]
 
-        p_c, suspected_classes, diag = lga_kde_detect(
-            flat_grads, flat_losses, history, self.kde_config)
+            p_c, suspected_classes, diag = lga_kde_detect(
+                flat_grads, flat_losses, history, self.kde_config)
 
-        # ---- 新增：基于 per-client 类梯度方向 做客户端级打分 ----
-        # suspected_classes 是可疑的类索引集合，如 {3, 8}
-        # 对每个客户端，计算其在可疑类上的梯度方向偏离历史均值的程度
-        client_suspicion = {cid: 0.0 for cid in range(self.num_clients)}
-        for cid in range(self.num_clients):
-            for c in suspected_classes:
-                if c in all_grad_dirs[cid]:
-                    # 当前轮该客户端该类的梯度方向（已归一化）
-                    curr = all_grad_dirs[cid][c].detach().cpu()
-                    curr = curr / (curr.norm() + 1e-12)
-                    # 历史均值方向（flat_grads 已是跨客户端平均，近似历史基准）
-                    hist = flat_grads[c].detach().cpu()
-                    hist = hist / (hist.norm() + 1e-12)
-                    cos_sim = (curr * hist).sum().item()
-                    # 偏离度累加：1 - cos_sim，越大越可疑
-                    client_suspicion[cid] += (1.0 - cos_sim)
+            # ---- 新增：基于 per-client 类梯度方向 做客户端级打分 ----
+            # suspected_classes 是可疑的类索引集合，如 {3, 8}
+            # 对每个客户端，计算其在可疑类上的梯度方向偏离历史均值的程度
+            client_suspicion = {cid: 0.0 for cid in range(self.num_clients)}
+            for cid in range(self.num_clients):
+                for c in suspected_classes:
+                    if c in all_grad_dirs[cid]:
+                        # 当前轮该客户端该类的梯度方向（已归一化）
+                        curr = all_grad_dirs[cid][c].detach().cpu()
+                        curr = curr / (curr.norm() + 1e-12)
+                        # 历史均值方向（flat_grads 已是跨客户端平均，近似历史基准）
+                        hist = flat_grads[c].detach().cpu()
+                        hist = hist / (hist.norm() + 1e-12)
+                        cos_sim = (curr * hist).sum().item()
+                        # 偏离度累加：1 - cos_sim，越大越可疑
+                        client_suspicion[cid] += (1.0 - cos_sim)
 
-        # 按嫌疑度降序，取前 mal_ratio 比例为恶意客户端
-        n_mal = max(1, int(self.num_clients * self.mal_ratio))
-        mal_clients = sorted(client_suspicion, key=client_suspicion.get, reverse=True)[:n_mal]
+            # 按嫌疑度降序，取前 mal_ratio 比例为恶意客户端
+            n_mal = max(1, int(self.num_clients * self.mal_ratio))
+            mal_clients = sorted(client_suspicion, key=client_suspicion.get, reverse=True)[:n_mal]
 
-        self.benign_clients = [c for c in range(self.num_clients) if c not in mal_clients]
-        if not self.benign_clients:
-            self.benign_clients = list(range(self.num_clients))
+            self.benign_clients = [c for c in range(self.num_clients) if c not in mal_clients]
+            if not self.benign_clients:
+                self.benign_clients = list(range(self.num_clients))
 
-        # ---- 连续软权重：嫌疑度越高权重越低，平滑过渡 ----
-        # 将 suspicion 归一化到 [0,1]，再映射到 [0.1, 1.0]
-        sus_vals = np.array([client_suspicion[c] for c in range(self.num_clients)], dtype=float)
-        if sus_vals.max() > sus_vals.min():
-            sus_norm = (sus_vals - sus_vals.min()) / (sus_vals.max() - sus_vals.min())
-        else:
-            sus_norm = np.zeros_like(sus_vals)
-        # sigmoid-like 映射：正常客户(低嫌疑)→1.0，高嫌疑→0.1
-        weights = 0.1 + 0.9 / (1.0 + np.exp(8.0 * (sus_norm - 0.5)))
-        # 强制确认的恶意客户端最低权重
-        for c in mal_clients:
-            weights[c] = min(weights[c], 0.1)
+            # ---- 连续软权重：嫌疑度越高权重越低，平滑过渡 ----
+            # 将 suspicion 归一化到 [0,1]，再映射到 [0.1, 1.0]
+            sus_vals = np.array([client_suspicion[c] for c in range(self.num_clients)], dtype=float)
+            if sus_vals.max() > sus_vals.min():
+                sus_norm = (sus_vals - sus_vals.min()) / (sus_vals.max() - sus_vals.min())
+            else:
+                sus_norm = np.zeros_like(sus_vals)
+            # sigmoid-like 映射：正常客户(低嫌疑)→1.0，高嫌疑→0.1
+            weights = 0.1 + 0.9 / (1.0 + np.exp(8.0 * (sus_norm - 0.5)))
+            # 强制确认的恶意客户端最低权重
+            for c in mal_clients:
+                weights[c] = min(weights[c], 0.1)
 
-        global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
 
-        client_updates = []
-        for cid in self.benign_clients:
-            local_model = get_model(self.model_name, num_classes=self.num_classes)
-            local_model.to(self.device)
-            local_model.load_state_dict(global_state_cpu)
-            loader = self.get_client_loader(cid)
-            local_state = local_train(
-                local_model, loader,
-                lr=self.lr, momentum=self.momentum,
-                weight_decay=self.weight_decay,
-                local_epochs=self.local_epochs,
-                device=self.device)
-            update = OrderedDict()
-            n_samples = len(loader.dataset)
-            for k in global_state_cpu:
-                update[k] = (local_state[k].cpu() -
-                             global_state_cpu[k]) * n_samples
-            client_updates.append((update, n_samples))
+            client_updates = []
+            # === 优化 1：复用预分配模型池（良性客户端）===
+            for cid in self.benign_clients:
+                local_model = self.local_models[cid]
+                local_model.load_state_dict(global_state_cpu)
+                loader = self.get_client_loader(cid)
+                local_state = local_train(
+                    local_model, loader,
+                    lr=self.lr, momentum=self.momentum,
+                    weight_decay=self.weight_decay,
+                    local_epochs=self.local_epochs,
+                    device=self.device)
+                update = OrderedDict()
+                n_samples = len(loader.dataset)
+                for k in global_state_cpu:
+                    update[k] = (local_state[k].cpu() -
+                                 global_state_cpu[k]) * n_samples
+                client_updates.append((update, n_samples))
 
-        trim_ratio = np.mean(
-            [p_c.get(c, 0.0) for c in flat_grads.keys()])
-        # Fix 3: 自适应 trim_ratio —— 仅对高污染可疑类计算，去除 legit_from 稀释
-        suspect_pcs = [p_c.get(c, 0.0) for c in suspected_classes if p_c.get(c, 0.0) > 0.2]
-        if suspect_pcs:
-            trim_ratio = min(0.3, max(0.05, np.mean(suspect_pcs) * 1.5))
-        else:
-            trim_ratio = 0.05
-        # Filter weights to only include benign clients
-        benign_weights = [weights[c] for c in self.benign_clients]
-        new_state = weighted_trimmed_aggregate(
-            global_state_cpu, client_updates, benign_weights, trim_ratio)
-        self.model.load_state_dict(new_state)
+            trim_ratio = np.mean(
+                [p_c.get(c, 0.0) for c in flat_grads.keys()])
+            # Fix 3: 自适应 trim_ratio —— 仅对高污染可疑类计算，去除 legit_from 稀释
+            suspect_pcs = [p_c.get(c, 0.0) for c in suspected_classes if p_c.get(c, 0.0) > 0.2]
+            if suspect_pcs:
+                trim_ratio = min(0.3, max(0.05, np.mean(suspect_pcs) * 1.5))
+            else:
+                trim_ratio = 0.05
+            # Filter weights to only include benign clients
+            benign_weights = [weights[c] for c in self.benign_clients]
+            new_state = weighted_trimmed_aggregate(
+                global_state_cpu, client_updates, benign_weights, trim_ratio)
+            self.model.load_state_dict(new_state)
 
-        class_masks = {}
-        for c in range(self.num_classes):
-            # 只对高污染分且在可疑类集合中的类生成掩码
-            if p_c.get(c, 0.0) > 0.2 and c in suspected_classes:
-                mask_vec = compute_class_mask_vector(
-                    self.model, all_class_mags, c, p_c[c],
-                    self.param_shapes)
-                mask_dict = unflatten_params(
-                    mask_vec.float(), self.param_shapes)
-                class_masks[c] = mask_dict
+            class_masks = {}
+            for c in range(self.num_classes):
+                # 只对高污染分且在可疑类集合中的类生成掩码
+                if p_c.get(c, 0.0) > 0.2 and c in suspected_classes:
+                    mask_vec = compute_class_mask_vector(
+                        self.model, all_class_mags, c, p_c[c],
+                        self.param_shapes)
+                    mask_dict = unflatten_params(
+                        mask_vec.float(), self.param_shapes)
+                    class_masks[c] = mask_dict
 
-        if class_masks:
-            for c, mask_dict in class_masks.items():
-                # 仅对 p_c > 0.15 的类做遗忘（与生成掩码阈值 0.2 对齐）
-                if p_c.get(c, 0.0) > 0.15:
-                    # 关键修正：遗忘类 c 时，干净数据应排除该类的“目标类”
-                    # 恶意修改：mal_from -> mal_to，合法修改：legit_from -> legit_to
-                    # 遗忘 mal_from 时，毒样本在 mal_to 里；遗忘 legit_from 时，毒样本在 legit_to 里
-                    exclude_classes = set()
-                    if c == self.mal_from:
-                        exclude_classes.add(self.mal_to)
-                    elif c == self.legit_from:
-                        exclude_classes.add(self.legit_to)
+            if class_masks:
+                for c, mask_dict in class_masks.items():
+                    # 仅对 p_c > 0.15 的类做遗忘（与生成掩码阈值 0.2 对齐）
+                    if p_c.get(c, 0.0) > 0.15:
+                        # 关键修正：遗忘类 c 时，干净数据应排除该类的“目标类”
+                        # 恶意修改：mal_from -> mal_to，合法修改：legit_from -> legit_to
+                        # 遗忘 mal_from 时，毒样本在 mal_to 里；遗忘 legit_from 时，毒样本在 legit_to 里
+                        exclude_classes = set()
+                        if c == self.mal_from:
+                            exclude_classes.add(self.mal_to)
+                        elif c == self.legit_from:
+                            exclude_classes.add(self.legit_to)
+
+                        # === 优化 3：clean_loader 缓存（按 exclude_classes 键缓存）===
+                        cache_key = tuple(sorted(exclude_classes))
+                        if cache_key in self._clean_loader_cache:
+                            clean_loader = self._clean_loader_cache[cache_key]
+                        else:
+                            clean_loader = create_clean_loader(
+                                self.train_set, list(range(len(self.train_set))),
+                                exclude_classes=exclude_classes, batch_size=self.batch_size,
+                                num_workers=self.nw, pin_memory=self.pm)
+                            if clean_loader is not None:
+                                self._clean_loader_cache[cache_key] = clean_loader
                     
-                    clean_loader = create_clean_loader(
-                        self.train_set, list(range(len(self.train_set))),
-                        exclude_classes=exclude_classes, batch_size=self.batch_size,
-                        num_workers=self.nw, pin_memory=self.pm)
-                    if clean_loader is not None:
-                        unlearned_state = surgical_unlearn(
-                            self.model, clean_loader, mask_dict,
-                            self.device, epochs=self.unlearn_epochs,
-                            lr=self.unlearn_lr, use_amp=self.use_amp)
-                        self.model.load_state_dict(unlearned_state)
+                        if clean_loader is not None:
+                            unlearned_state = surgical_unlearn(
+                                self.model, clean_loader, mask_dict,
+                                self.device, epochs=self.unlearn_epochs,
+                                lr=self.unlearn_lr, use_amp=self.use_amp)
+                            self.model.load_state_dict(unlearned_state)
 
-        self.history_tracker.update(flat_grads, flat_losses)
+            self.history_tracker.update(flat_grads, flat_losses)
 
-        all_suspects = mal_clients  # 检出的恶意客户端
+            all_suspects = mal_clients  # 检出的恶意客户端
 
-        return p_c, suspected_classes, all_suspects, diag, class_masks
+            return p_c, suspected_classes, all_suspects, diag, class_masks
 
     def run_standard_round(self):
         global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
         client_updates = []
 
+        # === 优化 1：复用预分配模型池，避免每轮 new + load_state_dict ===
         for cid in range(self.num_clients):
-            local_model = get_model(self.model_name, num_classes=self.num_classes)
-            local_model.to(self.device)
+            local_model = self.local_models[cid]
             local_model.load_state_dict(global_state_cpu)
             loader = self.get_client_loader(cid)
             local_state = local_train(
@@ -408,13 +424,13 @@ class LabelModifyExperiment:
         self.model.load_state_dict(new_state)
 
         # 标准轮只需为 4 个可疑类更新历史，省 60% 梯度计算时间
+        # === 优化 2：标准轮仅对良性客户端计算梯度（恶意梯度不进历史） ===
         suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
 
         all_grad_dirs = {}
         all_losses = {}
-        for cid in range(self.num_clients):
+        for cid in self.benign_clients:   # 仅良性客户端
             class_loaders = self.client_class_loaders[cid]
-            # 只取可疑类的 loader
             filtered_loaders = {c: loader for c, loader in class_loaders.items() if c in suspect_classes}
             grad_dirs, losses, _ = compute_class_conditional_gradients(
                 self.model, filtered_loaders, self.device)
