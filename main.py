@@ -325,6 +325,12 @@ class LabelModifyExperiment:
 
         trim_ratio = np.mean(
             [p_c.get(c, 0.0) for c in flat_grads.keys()])
+        # Fix 3: 自适应 trim_ratio —— 仅对高污染可疑类计算，去除 legit_from 稀释
+        suspect_pcs = [p_c.get(c, 0.0) for c in suspected_classes if p_c.get(c, 0.0) > 0.2]
+        if suspect_pcs:
+            trim_ratio = min(0.3, max(0.05, np.mean(suspect_pcs) * 1.5))
+        else:
+            trim_ratio = 0.05
         # Filter weights to only include benign clients
         benign_weights = [weights[c] for c in self.benign_clients]
         new_state = weighted_trimmed_aggregate(
@@ -416,12 +422,12 @@ class LabelModifyExperiment:
             all_losses[cid] = losses
 
         # Flatten per-round {cid → {c → grad}} into {c → grad_avg} for history
-        # 标准轮使用所有客户端更新历史基准
+        # 标准轮仅用良性客户端更新历史基准，防止恶意梯度污染基准
         flat_grads = {}
         flat_losses = {}
         from collections import defaultdict
         class_counts = defaultdict(int)
-        for cid in range(self.num_clients):
+        for cid in self.benign_clients:
             for c in all_grad_dirs[cid]:
                 if c not in flat_grads:
                     flat_grads[c] = all_grad_dirs[cid][c].clone()

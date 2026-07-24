@@ -154,6 +154,20 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
     min_history = kde_config.get("min_history", 3)
     tau_loss = kde_config.get("tau_loss", 2.0)
 
+    # Fix 2: 自适应 cos_threshold —— 基于历史 cos_sim 分布动态调整
+    # 早期历史少方差大 -> 阈值宽松(召回优先)；后期历史稳定 -> 阈值收紧(精确优先)
+    if len(grad_history) >= 5:
+        hist_cos_sims = []
+        for h_grads in grad_history[-5:]:
+            for c in h_grads:
+                if c in flat_grad_dirs:
+                    hist_avg = torch.stack([h[c] for h in grad_history[-5:] if c in h]).mean(0)
+                    hist_avg = hist_avg / (hist_avg.norm() + 1e-12)
+                    curr = flat_grad_dirs[c].cpu() / (flat_grad_dirs[c].norm() + 1e-12)
+                    hist_cos_sims.append((curr * hist_avg).sum().item())
+        if hist_cos_sims:
+            cos_threshold = max(0.65, float(np.mean(hist_cos_sims) - 1.5 * np.std(hist_cos_sims)))
+
     if len(grad_history) < min_history:
         return {}, set(), {}
 
