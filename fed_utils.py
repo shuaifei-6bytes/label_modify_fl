@@ -163,8 +163,9 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
                 if c in flat_grad_dirs:
                     hist_avg = torch.stack([h[c] for h in grad_history[-5:] if c in h]).mean(0)
                     hist_avg = hist_avg / (hist_avg.norm() + 1e-12)
-                    curr = flat_grad_dirs[c].cpu() / (flat_grad_dirs[c].norm() + 1e-12)
-                    hist_cos_sims.append((curr * hist_avg).sum().item())
+                    curr_avg = flat_grad_dirs[c].cpu()
+                    curr_avg = curr_avg / (curr_avg.norm() + 1e-12)
+                    hist_cos_sims.append((curr_avg * hist_avg).sum().item())
         if hist_cos_sims:
             cos_threshold = max(0.65, float(np.mean(hist_cos_sims) - 1.5 * np.std(hist_cos_sims)))
 
