@@ -150,24 +150,49 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
         diag: diagnostic info
     """
     grad_history, loss_history = history
-    cos_threshold = kde_config.get("cos_threshold", 0.85)  # cos < 0.85 => angle > 32°
+    cos_threshold = kde_config.get("cos_threshold", 0.85)  # 余弦相似度阈值，cos < 阈值即可疑
     min_history = kde_config.get("min_history", 3)
     tau_loss = kde_config.get("tau_loss", 2.0)
 
-    # Fix 2: 自适应 cos_threshold —— 基于历史 cos_sim 分布动态调整
-    # 早期历史少方差大 -> 阈值宽松(召回优先)；后期历史稳定 -> 阈值收紧(精确优先)
-    if len(grad_history) >= 5:
-        hist_cos_sims = []
-        for h_grads in grad_history[-5:]:
-            for c in h_grads:
-                if c in flat_grad_dirs:
-                    hist_avg = torch.stack([h[c] for h in grad_history[-5:] if c in h]).mean(0)
-                    hist_avg = hist_avg / (hist_avg.norm() + 1e-12)
-                    curr_avg = flat_grad_dirs[c].cpu()
-                    curr_avg = curr_avg / (curr_avg.norm() + 1e-12)
-                    hist_cos_sims.append((curr_avg * hist_avg).sum().item())
-        if hist_cos_sims:
-            cos_threshold = max(0.65, float(np.mean(hist_cos_sims) - 1.5 * np.std(hist_cos_sims)))
+    # Fix 2: 自适应 cos_threshold —— 轮次感知的动态调整
+    # 早期(历史<5轮): 阈值高(宽松, 召回优先, 保护良性精度)
+    # 中期(5-15轮): 线性过渡
+    # 后期(>15轮): 阈值低(严格, 精确优先, 彻底清洗恶意)
+    history_len = len(grad_history)
+    if history_len >= min_history:
+        # 基于轮次的调度：早期宽松 -> 后期严格
+        # history_len=3 -> 0.85, history_len=10 -> 0.75, history_len=20+ -> 0.65
+        if history_len < 5:
+            scheduled_threshold = 0.85  # 预热期：极宽松，仅捕捉极度异常
+        elif history_len < 15:
+            # 线性插值：0.85 -> 0.70
+            progress = (history_len - 5) / 10.0
+            scheduled_threshold = 0.85 - progress * 0.15
+        else:
+            scheduled_threshold = 0.65  # 稳定期：严格清洗
+        
+        # 结合数据驱动的自适应：基于历史 cos_sim 分布
+        if history_len >= 5:
+            hist_cos_sims = []
+            for h_grads in grad_history[-5:]:
+                for c in h_grads:
+                    if c in flat_grad_dirs:
+                        hist_avg = torch.stack([h[c] for h in grad_history[-5:] if c in h]).mean(0)
+                        hist_avg = hist_avg / (hist_avg.norm() + 1e-12)
+                        curr_avg = flat_grad_dirs[c].cpu()
+                        curr_avg = curr_avg / (curr_avg.norm() + 1e-12)
+                        hist_cos_sims.append((curr_avg * hist_avg).sum().item())
+            if hist_cos_sims:
+                data_driven_threshold = float(np.mean(hist_cos_sims) - 1.5 * np.std(hist_cos_sims))
+                data_driven_threshold = max(0.55, min(0.90, data_driven_threshold))  # 夹逼范围
+                # 取调度阈值和数据驱动阈值的较大者（更保守/宽松）
+                cos_threshold = max(scheduled_threshold, data_driven_threshold)
+            else:
+                cos_threshold = scheduled_threshold
+        else:
+            cos_threshold = scheduled_threshold
+    else:
+        cos_threshold = 0.85  # 历史不足时最宽松
 
     if len(grad_history) < min_history:
         return {}, set(), {}
@@ -182,8 +207,17 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
         for h_grads in grad_history:
             if c in h_grads:
                 hist_grads.append(h_grads[c].cpu())
+        # Fix: 非 IID 导致良性历史缺类时，回退到 all-client 平均
         if len(hist_grads) < 2:
-            p_c[c] = 0.0
+            # 尝试从 flat_grad_dirs (all-client 平均) 获取当前轮方向作为基准
+            if c in flat_grad_dirs:
+                # 用当前轮 all-client 平均方向作为"伪历史"均值
+                curr_avg = flat_grad_dirs[c].cpu()
+                curr_avg = curr_avg / (curr_avg.norm() + 1e-12)
+                # 无法计算 cos_sim，给中性分
+                p_c[c] = 0.5
+            else:
+                p_c[c] = 0.0
             continue
 
         # Compute historical average direction (unit vector)

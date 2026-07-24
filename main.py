@@ -289,22 +289,39 @@ class LabelModifyExperiment:
             p_c, suspected_classes, diag = lga_kde_detect(
                 flat_grads_all, flat_losses_all, history, self.kde_config)
 
-            # ---- 新增：基于 per-client 类梯度方向 做客户端级打分 ----
+            # ---- Fix 5: 客户端级检测增强 —— 加入梯度幅度 + 损失跳变信号 ----
             # suspected_classes 是可疑的类索引集合，如 {3, 8}
-            # 对每个客户端，计算其在可疑类上的梯度方向偏离历史均值的程度
+            # 对每个客户端，计算其在可疑类上的梯度方向偏离 + 幅度异常 + 损失异常
             client_suspicion = {cid: 0.0 for cid in range(self.num_clients)}
             for cid in range(self.num_clients):
                 for c in suspected_classes:
                     if c in all_grad_dirs[cid]:
-                        # 当前轮该客户端该类的梯度方向（已归一化）
+                        # 1. 方向偏离度 (原有)
                         curr = all_grad_dirs[cid][c].detach().cpu()
                         curr = curr / (curr.norm() + 1e-12)
-                        # 历史均值方向（flat_grads 已是跨客户端平均，近似历史基准）
                         hist = flat_grads[c].detach().cpu()
                         hist = hist / (hist.norm() + 1e-12)
                         cos_sim = (curr * hist).sum().item()
-                        # 偏离度累加：1 - cos_sim，越大越可疑
-                        client_suspicion[cid] += (1.0 - cos_sim)
+                        client_suspicion[cid] += (1.0 - cos_sim) * 1.0  # 权重 1.0
+
+                        # 2. 梯度幅度异常：恶意客户端在源类上的梯度幅度通常更大
+                        if c in all_class_mags[cid]:
+                            mag = all_class_mags[cid][c].mean().item()
+                            # 与良性客户端同类幅度中位数比较
+                            benign_mags = [all_class_mags[b][c].mean().item()
+                                           for b in self.benign_clients if c in all_class_mags[b]]
+                            if benign_mags:
+                                mag_ratio = mag / (np.median(benign_mags) + 1e-6)
+                                client_suspicion[cid] += max(0.0, mag_ratio - 1.0) * 0.5  # 权重 0.5
+
+                        # 3. 损失跳变：恶意类损失通常显著高于良性均值
+                        if c in all_losses[cid]:
+                            loss_val = all_losses[cid][c]
+                            benign_losses = [all_losses[b].get(c, 0.0)
+                                             for b in self.benign_clients if c in all_losses[b]]
+                            if benign_losses:
+                                loss_ratio = loss_val / (np.mean(benign_losses) + 1e-6)
+                                client_suspicion[cid] += max(0.0, loss_ratio - 1.0) * 0.5  # 权重 0.5
 
             # 按嫌疑度降序，取前 mal_ratio 比例为恶意客户端
             n_mal = max(1, int(self.num_clients * self.mal_ratio))
@@ -405,7 +422,8 @@ class LabelModifyExperiment:
                                 lr=self.unlearn_lr, use_amp=self.use_amp)
                             self.model.load_state_dict(unlearned_state)
 
-            self.history_tracker.update(flat_grads, flat_losses)
+            # Fix: 检测轮历史存 all-client 平均（与检测输入一致），标准轮存良性平均
+            self.history_tracker.update(flat_grads_all, flat_losses_all)
 
             all_suspects = mal_clients  # 检出的恶意客户端
 
@@ -415,8 +433,8 @@ class LabelModifyExperiment:
         global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
         client_updates = []
 
-        # === 优化 1：复用预分配模型池，避免每轮 new + load_state_dict ===
-        for cid in range(self.num_clients):
+        # === Fix 1: 标准轮仅训练+聚合良性客户端，恶意客户端完全隔离 ===
+        for cid in self.benign_clients:
             local_model = self.local_models[cid]
             local_model.load_state_dict(global_state_cpu)
             loader = self.get_client_loader(cid)
