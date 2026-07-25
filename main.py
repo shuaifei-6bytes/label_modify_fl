@@ -571,6 +571,11 @@ class LabelModifyExperiment:
                 p_c, S_c, all_suspects, diag, class_masks = \
                     self.run_detection_round()
 
+                # Debug: 打印历史长度和 p_c 详情
+                grad_hist, loss_hist = self.history_tracker.get_history()
+                hist_keys = [set(h.keys()) for h in grad_hist]
+                print(f"  [Round {r}] Debug: 历史长度={len(grad_hist)}, 历史类别={hist_keys}, p_c keys={list(p_c.keys())}")
+
                 detected_mal = [c for c in mal_clients
                                 if c in all_suspects]
                 false_pos = [c for c in all_suspects
