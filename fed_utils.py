@@ -155,21 +155,21 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
     tau_loss = kde_config.get("tau_loss", 2.0)
 
     # Fix 2: 自适应 cos_threshold —— 轮次感知的动态调整
-    # 早期(历史<5轮): 阈值高(宽松, 召回优先, 保护良性精度)
+    # 早期(历史<5轮): 阈值低(严格, 召回优先, 尽早捕获恶意)
     # 中期(5-15轮): 线性过渡
-    # 后期(>15轮): 阈值低(严格, 精确优先, 彻底清洗恶意)
+    # 后期(>15轮): 阈值更低(精确优先, 彻底清洗)
     history_len = len(grad_history)
     if history_len >= min_history:
-        # 基于轮次的调度：早期宽松 -> 后期严格
-        # history_len=3 -> 0.85, history_len=10 -> 0.75, history_len=20+ -> 0.65
+        # 基于轮次的调度：早期严格 -> 后期更严格
+        # history_len=3 -> 0.70, history_len=5 -> 0.65, history_len=10 -> 0.60, history_len=20+ -> 0.55
         if history_len < 5:
-            scheduled_threshold = 0.85  # 预热期：极宽松，仅捕捉极度异常
+            scheduled_threshold = 0.70  # 预热期：严格，尽早捕获
         elif history_len < 15:
-            # 线性插值：0.85 -> 0.70
+            # 线性插值：0.70 -> 0.55
             progress = (history_len - 5) / 10.0
-            scheduled_threshold = 0.85 - progress * 0.15
+            scheduled_threshold = 0.70 - progress * 0.15
         else:
-            scheduled_threshold = 0.65  # 稳定期：严格清洗
+            scheduled_threshold = 0.55  # 稳定期：极严格
         
         # 结合数据驱动的自适应：基于历史 cos_sim 分布
         if history_len >= 5:
@@ -184,18 +184,21 @@ def lga_kde_detect(flat_grad_dirs, flat_losses, history, kde_config, num_classes
                         hist_cos_sims.append((curr_avg * hist_avg).sum().item())
             if hist_cos_sims:
                 data_driven_threshold = float(np.mean(hist_cos_sims) - 1.5 * np.std(hist_cos_sims))
-                data_driven_threshold = max(0.55, min(0.90, data_driven_threshold))  # 夹逼范围
-                # 取调度阈值和数据驱动阈值的较大者（更保守/宽松）
-                cos_threshold = max(scheduled_threshold, data_driven_threshold)
+                data_driven_threshold = max(0.45, min(0.80, data_driven_threshold))  # 夹逼范围
+                # 取调度阈值和数据驱动阈值的较小者（更严格）
+                cos_threshold = min(scheduled_threshold, data_driven_threshold)
             else:
                 cos_threshold = scheduled_threshold
         else:
             cos_threshold = scheduled_threshold
     else:
-        cos_threshold = 0.85  # 历史不足时最宽松
+        cos_threshold = 0.70  # 历史不足时也严格
 
-    if len(grad_history) < min_history:
+    if len(grad_history) == 0:
         return {}, set(), {}
+
+    # 有历史但不足 min_history 时，不直接返回空，而是按类处理（给中性分 0.5）
+    # 这样即使预热轮历史类别不全，也能得到 p_c 而非完全空
 
     p_c = {}
     suspected_classes = set()
