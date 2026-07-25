@@ -287,12 +287,45 @@ class LabelModifyExperiment:
             flat_grads[c] /= class_counts[c]
             flat_losses[c] /= class_counts[c]
 
-        p_c, suspected_classes, diag = lga_kde_detect(
-            flat_grads_all, flat_losses_all, history, self.kde_config)
+        # ---- 新检测逻辑：类污染度 = 全客户端均值 vs 良性均值的夹角 ----
+        # 这样恶意梯度不会被良性稀释，直接测量污染偏移
+        p_c = {}
+        suspected_classes = set()
+        for c in flat_grads_all.keys():
+            if c in flat_grads:
+                v_all = flat_grads_all[c].detach().cpu()
+                v_ben = flat_grads[c].detach().cpu()
+                v_all = v_all / (v_all.norm() + 1e-12)
+                v_ben = v_ben / (v_ben.norm() + 1e-12)
+                cos_sim = (v_all * v_ben).sum().item()
+                p_c[c] = float(1.0 - cos_sim)  # 污染度：0=纯净, 1=完全反向
+            else:
+                p_c[c] = 0.0
 
-        # ---- Fix: 客户端级检测覆盖所有 4 个可疑类，防止 Non-IID 缺类导致 suspected_classes 为空 ----
-        # suspected_classes 可能为空（历史缺类），此时无该类不足），但恶意客户端在源类上仍有异常信号
-        # 因此以 4 个可疑类全集计算嫌疑度，三信号（方向/幅度/损失）兜底
+        # 自适应阈值：基于历史 p_c 分布
+        hist = self.history_tracker.get_history()[0]  # grad_history
+        if len(hist) >= 3:
+            past_pcs = []
+            for h in hist[-5:]:
+                for c, v in p_c.items():
+                    if c in h:
+                        hv = h[c].cpu()
+                        hv = hv / (hv.norm() + 1e-12)
+                        cv = flat_grads_all[c].cpu() / (flat_grads_all[c].norm() + 1e-12)
+                        past_pcs.append(1.0 - (hv * cv).sum().item())
+            if past_pcs:
+                thresh = float(np.mean(past_pcs) + 1.5 * np.std(past_pcs))
+                thresh = max(0.15, min(0.5, thresh))  # clamp
+            else:
+                thresh = 0.2
+        else:
+            thresh = 0.2  # 预热期固定阈值
+
+        for c, v in p_c.items():
+            if v > thresh:
+                suspected_classes.add(c)
+
+        # ---- 客户端级检测（沿用原三信号，不变）----
         client_suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
 
         client_suspicion = {cid: 0.0 for cid in range(self.num_clients)}
@@ -429,6 +462,7 @@ class LabelModifyExperiment:
 
         all_suspects = mal_clients  # 检出的恶意客户端
 
+        diag = {"p_c_thresh": thresh, "p_c_raw": p_c}
         return p_c, suspected_classes, all_suspects, diag, class_masks
 
     def run_standard_round(self):
@@ -579,6 +613,10 @@ class LabelModifyExperiment:
                 grad_hist, loss_hist = self.history_tracker.get_history()
                 hist_keys = [set(h.keys()) for h in grad_hist]
                 print(f"  [Round {r}] Debug: 历史长度={len(grad_hist)}, 历史类别={hist_keys}, p_c keys={list(p_c.keys())}")
+
+                # 打印阈值和完整 p_c 用于调试
+                t_val = diag.get("p_c_thresh", "N/A") if diag else "N/A"
+                print(f"  [Round {r}] 检测阈值: {t_val:.3f}")
 
                 detected_mal = [c for c in mal_clients
                                 if c in all_suspects]
