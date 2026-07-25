@@ -479,8 +479,10 @@ class LabelModifyExperiment:
         self.setup_data()
         self.setup_model()
 
-        warmup_rounds = max(2, self.detection_interval - 1)
-        print(f"\n--- 预热阶段 ({warmup_rounds} 轮) ---")
+        # ========== 预热阶段：仅良性客户端聚合，无攻击、无标签修改 ==========
+        warmup_rounds = 10
+        print(f"\n--- 预热阶段 ({warmup_rounds} 轮)：仅良性聚合，无攻击 ---")
+        self.benign_clients = list(range(self.num_clients))  # 所有客户端均为良性
         for r in range(1, warmup_rounds + 1):
             self.current_round = r
             t0 = time.time()
@@ -488,7 +490,8 @@ class LabelModifyExperiment:
             metrics = self.evaluate_round()
             elapsed = time.time() - t0
             print(f"  [Round {r:3d}] Acc(all)={metrics['acc_all']:6.2f}%  "
-                  f"Acc(clean)={metrics['acc_clean']:6.2f}%  ({elapsed:.1f}s)")
+                  f"Acc(clean)={metrics['acc_clean']:6.2f}%  "
+                  f"Acc(forget)={metrics['acc_forget']:6.2f}%  ({elapsed:.1f}s)")
 
             self.metrics["round"].append(r)
             self.metrics["acc_all"].append(metrics["acc_all"])
@@ -500,7 +503,8 @@ class LabelModifyExperiment:
             self.metrics["p_c_legit_from"].append(0.0)
             self.metrics["n_suspects"].append(0)
 
-        print(f"\n--- 检测与遗忘阶段 (第 {warmup_rounds+1} 轮起) ---")
+        # ========== 检测与遗忘阶段：开始有恶意客户端和标签修改 ==========
+        print(f"\n--- 检测与遗忘阶段 (第 {warmup_rounds+1} 轮起)：引入恶意客户端 ---")
         for r in range(warmup_rounds + 1, self.global_rounds + 1):
             self.current_round = r
             t0 = time.time()
@@ -530,12 +534,15 @@ class LabelModifyExperiment:
                 false_neg = [c for c in mal_clients if c not in all_suspects]
 
                 polluted = [c for c in range(self.num_classes)
-                            if p_c.get(c, 0.0) > 0.2]
+                            if p_c.get(c, 0.0) > 0.01]  # 降低阈值 0.2->0.01，确保看到所有非零 p_c
                 p_c_str = ", ".join(
                     f"c{c}={p_c.get(c,0):.2f}" for c in polluted)
 
+                # 调试：完整输出所有 p_c
+                all_p_c_str = ", ".join(f"c{c}={p_c.get(c,0):.3f}" for c in sorted(p_c.keys()))
                 print(f"  [Round {r}] 余弦相似度: p_c=[{p_c_str}], "
                       f"可疑={len(all_suspects)}/{self.num_clients}")
+                print(f"  [Round {r}] 完整 p_c: [{all_p_c_str}]")
                 print(f"  [Round {r}] 检测: "
                       f"命中恶意={len(detected_mal)}/{len(mal_clients)}, "
                       f"误报={len(false_pos)}, 漏报={len(false_neg)}")
