@@ -311,7 +311,9 @@ class LabelModifyExperiment:
                     if c in h:
                         hv = h[c].cpu()
                         hv = hv / (hv.norm() + 1e-12)
-                        cv = flat_grads_all[c].cpu() / (flat_grads_all[c].norm() + 1e-12)
+                        # Ensure flat_grads_all[c] is on CPU before computation
+                        cv = flat_grads_all[c].detach().cpu()
+                        cv = cv / (cv.norm() + 1e-12)
                         past_pcs.append(1.0 - (hv * cv).sum().item())
             if past_pcs:
                 thresh = float(np.mean(past_pcs) + 1.5 * np.std(past_pcs))
