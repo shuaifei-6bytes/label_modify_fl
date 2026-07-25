@@ -424,8 +424,8 @@ class LabelModifyExperiment:
                             lr=self.unlearn_lr, use_amp=self.use_amp)
                         self.model.load_state_dict(unlearned_state)
 
-        # Fix: 检测轮历史存 all-client 平均（与检测输入一致），标准轮存良性平均
-        self.history_tracker.update(flat_grads_all, flat_losses_all)
+        # Fix: 检测轮历史仅存良性客户端平均，防止恶意梯度污染历史基准
+        self.history_tracker.update(flat_grads, flat_losses)
 
         all_suspects = mal_clients  # 检出的恶意客户端
 
