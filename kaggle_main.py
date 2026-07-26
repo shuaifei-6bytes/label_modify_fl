@@ -217,6 +217,8 @@ class LabelModifyExperiment:
         all_losses = {}
         all_class_mags = {}
 
+        # 只对 4 个可疑类计算梯度：mal_from, legit_from, mal_to, legit_to
+        # 其余 6 类跳过，直接节省 60% 检测轮显存/时间，语义完全保留
         suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
 
         for cid in range(self.num_clients):
@@ -229,6 +231,8 @@ class LabelModifyExperiment:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
+        # Flatten per-round {cid → {c → grad}} into {c → grad_avg} for KDE
+        # === 修复：用【全客户端平均】做检测，良性均值仅用于聚合 ===
         flat_grads_all = {}
         flat_losses_all = {}
         from collections import defaultdict
@@ -246,6 +250,7 @@ class LabelModifyExperiment:
             flat_grads_all[c] /= class_counts_all[c]
             flat_losses_all[c] /= class_counts_all[c]
 
+        # 良性客户端均值（仅用于聚合加权）
         flat_grads = {}
         flat_losses = {}
         class_counts = defaultdict(int)
@@ -262,18 +267,54 @@ class LabelModifyExperiment:
             flat_grads[c] /= class_counts[c]
             flat_losses[c] /= class_counts[c]
 
-        p_c, suspected_classes, diag = lga_kde_detect(
-            flat_grads_all, flat_losses_all, history, self.kde_config)
+        # ---- 新检测逻辑：类污染度 = 全客户端均值 vs 良性均值的夹角 ----
+        # 这样恶意梯度不会被良性稀释，直接测量污染偏移
+        p_c = {}
+        suspected_classes = set()
+        for c in flat_grads_all.keys():
+            if c in flat_grads:
+                v_all = flat_grads_all[c].detach().cpu()
+                v_ben = flat_grads[c].detach().cpu()
+                v_all = v_all / (v_all.norm() + 1e-12)
+                v_ben = v_ben / (v_ben.norm() + 1e-12)
+                cos_sim = (v_all * v_ben).sum().item()
+                p_c[c] = float(1.0 - cos_sim)  # 污染度：0=纯净, 1=完全反向
+            else:
+                p_c[c] = 0.0
 
-        # ---- Fix: 客户端级检测覆盖所有 4 个可疑类，防止 Non-IID 缺类导致 suspected_classes 为空 ----
-        # suspected_classes 可能为空（历史该类不足），但恶意客户端在源类上仍有异常信号
-        # 因此以 4 个可疑类全集计算嫌疑度，三信号（方向/幅度/损失）兜底
+        # 自适应阈值：基于历史 p_c 分布
+        hist = self.history_tracker.get_history()[0]  # grad_history
+        if len(hist) >= 3:
+            past_pcs = []
+            for h in hist[-5:]:
+                for c, v in p_c.items():
+                    if c in h:
+                        hv = h[c].cpu()
+                        hv = hv / (hv.norm() + 1e-12)
+                        # Ensure flat_grads_all[c] is on CPU before computation
+                        cv = flat_grads_all[c].detach().cpu()
+                        cv = cv / (cv.norm() + 1e-12)
+                        past_pcs.append(1.0 - (hv * cv).sum().item())
+            if past_pcs:
+                thresh = float(np.mean(past_pcs) + 1.5 * np.std(past_pcs))
+                thresh = max(0.15, min(0.5, thresh))  # clamp
+            else:
+                thresh = 0.2
+        else:
+            thresh = 0.2  # 预热期固定阈值
+
+        for c, v in p_c.items():
+            if v > thresh:
+                suspected_classes.add(c)
+
+        # ---- 客户端级检测（沿用原三信号，不变）----
         client_suspect_classes = {self.mal_from, self.legit_from, self.mal_to, self.legit_to}
 
         client_suspicion = {cid: 0.0 for cid in range(self.num_clients)}
         for cid in range(self.num_clients):
             for c in client_suspect_classes:
                 if c in all_grad_dirs[cid]:
+                    # 1. 方向偏离度
                     curr = all_grad_dirs[cid][c].detach().cpu()
                     curr = curr / (curr.norm() + 1e-12)
                     hist = flat_grads[c].detach().cpu()
@@ -281,6 +322,7 @@ class LabelModifyExperiment:
                     cos_sim = (curr * hist).sum().item()
                     client_suspicion[cid] += (1.0 - cos_sim) * 1.0
 
+                    # 2. 梯度幅度异常
                     if c in all_class_mags[cid]:
                         mag = all_class_mags[cid][c].mean().item()
                         benign_mags = [all_class_mags[b][c].mean().item()
@@ -289,14 +331,16 @@ class LabelModifyExperiment:
                             mag_ratio = mag / (np.median(benign_mags) + 1e-6)
                             client_suspicion[cid] += max(0.0, mag_ratio - 1.0) * 0.5
 
-                    if c in all_losses[cid]:
-                        loss_val = all_losses[cid][c]
-                        benign_losses = [all_losses[b].get(c, 0.0)
-                                         for b in self.benign_clients if c in all_losses[b]]
-                        if benign_losses:
-                            loss_ratio = loss_val / (np.mean(benign_losses) + 1e-6)
-                            client_suspicion[cid] += max(0.0, loss_ratio - 1.0) * 0.5
+                        # 3. 损失跳变
+                        if c in all_losses[cid]:
+                            loss_val = all_losses[cid][c]
+                            benign_losses = [all_losses[b].get(c, 0.0)
+                                             for b in self.benign_clients if c in all_losses[b]]
+                            if benign_losses:
+                                loss_ratio = loss_val / (np.mean(benign_losses) + 1e-6)
+                                client_suspicion[cid] += max(0.0, loss_ratio - 1.0) * 0.5
 
+        # 按嫌疑度降序，取前 mal_ratio 比例为恶意客户端
         n_mal = max(1, int(self.num_clients * self.mal_ratio))
         mal_clients = sorted(client_suspicion, key=client_suspicion.get, reverse=True)[:n_mal]
 
@@ -304,18 +348,23 @@ class LabelModifyExperiment:
         if not self.benign_clients:
             self.benign_clients = list(range(self.num_clients))
 
+        # ---- 连续软权重：嫌疑度越高权重越低，平滑过渡 ----
+        # 将 suspicion 归一化到 [0,1]，再映射到 [0.1, 1.0]
         sus_vals = np.array([client_suspicion[c] for c in range(self.num_clients)], dtype=float)
         if sus_vals.max() > sus_vals.min():
             sus_norm = (sus_vals - sus_vals.min()) / (sus_vals.max() - sus_vals.min())
         else:
             sus_norm = np.zeros_like(sus_vals)
+        # sigmoid-like 映射：正常客户(低嫌疑)→1.0，高嫌疑→0.1
         weights = 0.1 + 0.9 / (1.0 + np.exp(8.0 * (sus_norm - 0.5)))
+        # 强制确认的恶意客户端最低权重
         for c in mal_clients:
             weights[c] = min(weights[c], 0.1)
 
         global_state_cpu = {k: v.cpu() for k, v in self.model.state_dict().items()}
 
         client_updates = []
+        # === 优化 1：复用预分配模型池（良性客户端）===
         for cid in self.benign_clients:
             local_model = self.local_models[cid]
             local_model.load_state_dict(global_state_cpu)
@@ -329,14 +378,19 @@ class LabelModifyExperiment:
             update = OrderedDict()
             n_samples = len(loader.dataset)
             for k in global_state_cpu:
-                update[k] = (local_state[k].cpu() - global_state_cpu[k]) * n_samples
+                update[k] = (local_state[k].cpu() -
+                             global_state_cpu[k]) * n_samples
             client_updates.append((update, n_samples))
 
+        trim_ratio = np.mean(
+                [p_c.get(c, 0.0) for c in flat_grads.keys()])
+        # Fix 3: 自适应 trim_ratio —— 仅对高污染可疑类计算，去除 legit_from 稀释
         suspect_pcs = [p_c.get(c, 0.0) for c in suspected_classes if p_c.get(c, 0.0) > 0.2]
         if suspect_pcs:
             trim_ratio = min(0.3, max(0.05, np.mean(suspect_pcs) * 1.5))
         else:
             trim_ratio = 0.05
+        # Filter weights to only include benign clients
         benign_weights = [weights[c] for c in self.benign_clients]
         new_state = weighted_trimmed_aggregate(
             global_state_cpu, client_updates, benign_weights, trim_ratio)
@@ -344,6 +398,7 @@ class LabelModifyExperiment:
 
         class_masks = {}
         for c in range(self.num_classes):
+            # 只对高污染分且在可疑类集合中的类生成掩码
             if p_c.get(c, 0.0) > 0.2 and c in suspected_classes:
                 mask_vec = compute_class_mask_vector(
                     self.model, all_class_mags, c, p_c[c],
@@ -354,13 +409,18 @@ class LabelModifyExperiment:
 
         if class_masks:
             for c, mask_dict in class_masks.items():
+                # 仅对 p_c > 0.15 的类做遗忘（与生成掩码阈值 0.2 对齐）
                 if p_c.get(c, 0.0) > 0.15:
+                    # 关键修正：遗忘类 c 时，干净数据应排除该类的"目标类"
+                    # 恶意修改：mal_from -> mal_to，合法修改：legit_from -> legit_to
+                    # 遗忘 mal_from 时，毒样本在 mal_to 里；遗忘 legit_from 时，毒样本在 legit_to 里
                     exclude_classes = set()
                     if c == self.mal_from:
                         exclude_classes.add(self.mal_to)
                     elif c == self.legit_from:
                         exclude_classes.add(self.legit_to)
 
+                    # === 优化 3：clean_loader 缓存（按 exclude_classes 键缓存）===
                     cache_key = tuple(sorted(exclude_classes))
                     if cache_key in self._clean_loader_cache:
                         clean_loader = self._clean_loader_cache[cache_key]
@@ -379,11 +439,12 @@ class LabelModifyExperiment:
                             lr=self.unlearn_lr, use_amp=self.use_amp)
                         self.model.load_state_dict(unlearned_state)
 
-        self.history_tracker.update(flat_grads_all, flat_losses_all)
+        # Fix: 检测轮历史仅存良性客户端平均，防止恶意梯度污染历史基准
+        self.history_tracker.update(flat_grads, flat_losses)
 
-        # all_suspects 仅在检测轮有意义，标准轮为空列表
-        all_suspects = mal_clients if 'mal_clients' in locals() else []
+        all_suspects = mal_clients  # 检出的恶意客户端
 
+        diag = {"p_c_thresh": thresh, "p_c_raw": p_c}
         return p_c, suspected_classes, all_suspects, diag, class_masks
 
     def run_standard_round(self):
