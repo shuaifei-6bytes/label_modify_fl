@@ -340,8 +340,16 @@ class LabelModifyExperiment:
                                 loss_ratio = loss_val / (np.mean(benign_losses) + 1e-6)
                                 client_suspicion[cid] += max(0.0, loss_ratio - 1.0) * 0.5
 
-        # 按嫌疑度降序，取前 mal_ratio 比例为恶意客户端
-        n_mal = max(1, int(self.num_clients * self.mal_ratio))
+        # 按嫌疑度降序，自适应估计恶意客户端数量（间隙法）
+        sus_scores = sorted(client_suspicion.values(), reverse=True)
+        if len(sus_scores) > 1:
+            gaps = [sus_scores[i] - sus_scores[i + 1] for i in range(len(sus_scores) - 1)]
+            k_gap = gaps.index(max(gaps)) + 1  # 最大间隙后的索引 = 估计恶意数
+        else:
+            k_gap = 1
+        # 保护：至少 1 个，不超过 2 倍预期恶意数
+        max_mal = max(1, int(self.num_clients * self.mal_ratio * 2))
+        n_mal = max(1, min(k_gap, max_mal))
         mal_clients = sorted(client_suspicion, key=client_suspicion.get, reverse=True)[:n_mal]
 
         self.benign_clients = [c for c in range(self.num_clients) if c not in mal_clients]
